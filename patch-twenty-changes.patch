@@ -13,7 +13,7 @@ index 97dc38ee8..df4e543db 100644
 +.github/instructions/nx.instructions.md
 +.aider*
 diff --git a/packages/twenty-docker/twenty/Dockerfile b/packages/twenty-docker/twenty/Dockerfile
-index 217eed0e7..79525f6b7 100644
+index 217eed0e7..9fd72c071 100644
 --- a/packages/twenty-docker/twenty/Dockerfile
 +++ b/packages/twenty-docker/twenty/Dockerfile
 @@ -28,6 +28,7 @@ COPY ./packages/twenty-emails /app/packages/twenty-emails
@@ -24,6 +24,55 @@ index 217eed0e7..79525f6b7 100644
  RUN npx nx run twenty-server:build
  RUN mv /app/packages/twenty-server/dist /app/packages/twenty-server/build
  RUN npx nx run twenty-server:build:packageJson
+@@ -52,6 +53,9 @@ RUN npx nx build twenty-front
+ # Final stage: Run the application
+ FROM node:22-alpine as twenty
+ 
++# Stay as root for system package installations
++USER root
++
+ # Used to run healthcheck in docker
+ RUN apk add --no-cache curl jq
+ 
+@@ -59,8 +63,14 @@ RUN npm install -g tsx
+ 
+ RUN apk add --no-cache postgresql-client
+ 
+-COPY ./packages/twenty-docker/twenty/entrypoint.sh /app/entrypoint.sh
++# Create directories with proper ownership from the start
++RUN mkdir -p /app/.local-storage /app/packages/twenty-server/.local-storage && \
++    chown -R node:node /app
++
++COPY --chown=node:node ./packages/twenty-docker/twenty/entrypoint.sh /app/entrypoint.sh
+ RUN chmod +x /app/entrypoint.sh
++
++
+ WORKDIR /app/packages/twenty-server
+ 
+ ARG REACT_APP_SERVER_BASE_URL
+@@ -70,19 +80,13 @@ ARG APP_VERSION
+ ENV APP_VERSION $APP_VERSION
+ 
+ # Copy built applications from previous stages
+-COPY --chown=1000 --from=twenty-server-build /app /app
+-COPY --chown=1000 --from=twenty-server-build /app/packages/twenty-server /app/packages/twenty-server
+-COPY --chown=1000 --from=twenty-front-build /app/packages/twenty-front/build /app/packages/twenty-server/dist/front
++COPY --chown=node:node --from=twenty-server-build /app /app
++COPY --chown=node:node --from=twenty-server-build /app/packages/twenty-server /app/packages/twenty-server
++COPY --chown=node:node --from=twenty-front-build /app/packages/twenty-front/build /app/packages/twenty-server/dist/front
+ 
+ # Set metadata and labels
+ LABEL org.opencontainers.image.source=https://github.com/twentyhq/twenty
+ LABEL org.opencontainers.image.description="This image provides a consistent and reproducible environment for the backend and frontend, ensuring it deploys faster and runs the same way regardless of the deployment environment."
+ 
+-RUN mkdir -p /app/.local-storage /app/packages/twenty-server/.local-storage && \
+-    chown -R 1000:1000 /app
+-
+-# Use non root user with uid 1000
+-USER 1000
+-
+ CMD ["node", "dist/src/main"]
+ ENTRYPOINT ["/app/entrypoint.sh"]
 diff --git a/packages/twenty-server/src/engine/core-modules/twenty-config/config-variables.ts b/packages/twenty-server/src/engine/core-modules/twenty-config/config-variables.ts
 index 614edb1ae..54703ef88 100644
 --- a/packages/twenty-server/src/engine/core-modules/twenty-config/config-variables.ts
@@ -44,6 +93,363 @@ index 614edb1ae..54703ef88 100644
    @ConfigVariablesMetadata({
      group: ConfigVariablesGroup.MicrosoftAuth,
      description: 'Enable or disable the Microsoft Calendar integration',
+diff --git a/packages/twenty-server/src/modules/connected-account/connected-account.module.ts b/packages/twenty-server/src/modules/connected-account/connected-account.module.ts
+index 3888f9603..9615e917b 100644
+--- a/packages/twenty-server/src/modules/connected-account/connected-account.module.ts
++++ b/packages/twenty-server/src/modules/connected-account/connected-account.module.ts
+@@ -1,18 +1,35 @@
+ import { Module } from '@nestjs/common';
++import { TypeOrmModule } from '@nestjs/typeorm';
+ 
++import { CacheStorageModule } from 'src/engine/core-modules/cache-storage/cache-storage.module';
++import { MetricsModule } from 'src/engine/core-modules/metrics/metrics.module';
+ import { UserVarsModule } from 'src/engine/core-modules/user/user-vars/user-vars.module';
++import { Workspace } from 'src/engine/core-modules/workspace/workspace.entity';
++import { CalendarChannelSyncStatusService } from 'src/modules/calendar/common/services/calendar-channel-sync-status.service';
++import { ConnectedAccountAutoReconnectCronCommand } from 'src/modules/connected-account/crons/commands/connected-account-auto-reconnect.cron.command';
++import { ConnectedAccountAutoReconnectCronJob } from 'src/modules/connected-account/crons/jobs/connected-account-auto-reconnect.cron.job';
+ import { DeleteWorkspaceMemberConnectedAccountsCleanupJob } from 'src/modules/connected-account/jobs/delete-workspace-member-connected-accounts.job';
+ import { ConnectedAccountWorkspaceMemberListener } from 'src/modules/connected-account/listeners/connected-account-workspace-member.listener';
+ import { ConnectedAccountListener } from 'src/modules/connected-account/listeners/connected-account.listener';
+ import { AccountsToReconnectService } from 'src/modules/connected-account/services/accounts-to-reconnect.service';
++import { MessageChannelSyncStatusService } from 'src/modules/messaging/common/services/message-channel-sync-status.service';
+ 
+ @Module({
+-  imports: [UserVarsModule],
++  imports: [
++    UserVarsModule,
++    TypeOrmModule.forFeature([Workspace], 'core'),
++    CacheStorageModule,
++    MetricsModule,
++  ],
+   providers: [
+     AccountsToReconnectService,
+     ConnectedAccountListener,
+     DeleteWorkspaceMemberConnectedAccountsCleanupJob,
+     ConnectedAccountWorkspaceMemberListener,
++    ConnectedAccountAutoReconnectCronJob,
++    ConnectedAccountAutoReconnectCronCommand,
++    MessageChannelSyncStatusService,
++    CalendarChannelSyncStatusService,
+   ],
+   exports: [AccountsToReconnectService],
+ })
+diff --git a/packages/twenty-server/src/modules/connected-account/crons/commands/connected-account-auto-reconnect.cron.command.ts b/packages/twenty-server/src/modules/connected-account/crons/commands/connected-account-auto-reconnect.cron.command.ts
+new file mode 100644
+index 000000000..ce2af4757
+--- /dev/null
++++ b/packages/twenty-server/src/modules/connected-account/crons/commands/connected-account-auto-reconnect.cron.command.ts
+@@ -0,0 +1,73 @@
++import { Command, CommandRunner, Option } from 'nest-commander';
++
++import { InjectMessageQueue } from 'src/engine/core-modules/message-queue/decorators/message-queue.decorator';
++import { MessageQueue } from 'src/engine/core-modules/message-queue/message-queue.constants';
++import { MessageQueueService } from 'src/engine/core-modules/message-queue/services/message-queue.service';
++import {
++  CONNECTED_ACCOUNT_AUTO_RECONNECT_CRON_PATTERN,
++  ConnectedAccountAutoReconnectCronJob,
++} from 'src/modules/connected-account/crons/jobs/connected-account-auto-reconnect.cron.job';
++
++interface ConnectedAccountAutoReconnectCronCommandOptions {
++  schedule?: boolean;
++}
++
++@Command({
++  name: 'cron:connected-account:auto-reconnect',
++  description:
++    'Run connected account auto-reconnect job immediately or schedule it as a cron job',
++})
++export class ConnectedAccountAutoReconnectCronCommand extends CommandRunner {
++  constructor(
++    @InjectMessageQueue(MessageQueue.cronQueue)
++    private readonly messageQueueService: MessageQueueService,
++    private readonly connectedAccountAutoReconnectCronJob: ConnectedAccountAutoReconnectCronJob,
++  ) {
++    super();
++  }
++
++  async run(
++    passedParams: string[],
++    options?: ConnectedAccountAutoReconnectCronCommandOptions,
++  ): Promise<void> {
++    if (options?.schedule) {
++      // Schedule the cron job
++      await this.messageQueueService.addCron<undefined>({
++        jobName: ConnectedAccountAutoReconnectCronJob.name,
++        data: undefined,
++        options: {
++          repeat: {
++            pattern: CONNECTED_ACCOUNT_AUTO_RECONNECT_CRON_PATTERN,
++          },
++        },
++      });
++      console.log('Cron job scheduled successfully');
++    } else {
++      // Run the job immediately
++      console.log(
++        'Running connected account auto-reconnect job immediately...',
++      );
++      try {
++        await this.connectedAccountAutoReconnectCronJob.handle();
++        console.log('Connected account auto-reconnect job completed');
++
++        // Give time for any pending operations to complete before shutdown
++        await new Promise((resolve) => setTimeout(resolve, 1000));
++      } catch (error) {
++        console.error(
++          'Error running connected account auto-reconnect job:',
++          error,
++        );
++        throw error;
++      }
++    }
++  }
++
++  @Option({
++    flags: '-s, --schedule',
++    description: 'Schedule the job as a cron instead of running immediately',
++  })
++  parseSchedule(): boolean {
++    return true;
++  }
++}
+diff --git a/packages/twenty-server/src/modules/connected-account/crons/jobs/connected-account-auto-reconnect.cron.job.ts b/packages/twenty-server/src/modules/connected-account/crons/jobs/connected-account-auto-reconnect.cron.job.ts
+new file mode 100644
+index 000000000..3e1c09d38
+--- /dev/null
++++ b/packages/twenty-server/src/modules/connected-account/crons/jobs/connected-account-auto-reconnect.cron.job.ts
+@@ -0,0 +1,231 @@
++import { Logger } from '@nestjs/common';
++import { InjectRepository } from '@nestjs/typeorm';
++
++import { WorkspaceActivationStatus } from 'twenty-shared/workspace';
++import { IsNull, Not, Repository } from 'typeorm';
++
++import { SentryCronMonitor } from 'src/engine/core-modules/cron/sentry-cron-monitor.decorator';
++import { ExceptionHandlerService } from 'src/engine/core-modules/exception-handler/exception-handler.service';
++import { Process } from 'src/engine/core-modules/message-queue/decorators/process.decorator';
++import { Processor } from 'src/engine/core-modules/message-queue/decorators/processor.decorator';
++import { MessageQueue } from 'src/engine/core-modules/message-queue/message-queue.constants';
++import { Workspace } from 'src/engine/core-modules/workspace/workspace.entity';
++import { TwentyORMGlobalManager } from 'src/engine/twenty-orm/twenty-orm-global.manager';
++import {
++  CalendarChannelSyncStage,
++  CalendarChannelSyncStatus,
++  CalendarChannelWorkspaceEntity,
++} from 'src/modules/calendar/common/standard-objects/calendar-channel.workspace-entity';
++import { AccountsToReconnectService } from 'src/modules/connected-account/services/accounts-to-reconnect.service';
++import { ConnectedAccountWorkspaceEntity } from 'src/modules/connected-account/standard-objects/connected-account.workspace-entity';
++import {
++  MessageChannelSyncStage,
++  MessageChannelSyncStatus,
++  MessageChannelWorkspaceEntity,
++} from 'src/modules/messaging/common/standard-objects/message-channel.workspace-entity';
++
++export const CONNECTED_ACCOUNT_AUTO_RECONNECT_CRON_PATTERN = '*/10 * * * *'; // Every 10 minutes
++
++@Processor(MessageQueue.cronQueue)
++export class ConnectedAccountAutoReconnectCronJob {
++  private readonly logger = new Logger(
++    ConnectedAccountAutoReconnectCronJob.name,
++  );
++
++  constructor(
++    @InjectRepository(Workspace, 'core')
++    private readonly workspaceRepository: Repository<Workspace>,
++    private readonly twentyORMGlobalManager: TwentyORMGlobalManager,
++    private readonly accountsToReconnectService: AccountsToReconnectService,
++    private readonly exceptionHandlerService: ExceptionHandlerService,
++  ) {}
++
++  @Process(ConnectedAccountAutoReconnectCronJob.name)
++  @SentryCronMonitor(
++    ConnectedAccountAutoReconnectCronJob.name,
++    CONNECTED_ACCOUNT_AUTO_RECONNECT_CRON_PATTERN,
++  )
++  async handle(): Promise<void> {
++    this.logger.log('Starting connected account auto-reconnect job');
++
++    const activeWorkspaces = await this.workspaceRepository.find({
++      where: {
++        activationStatus: WorkspaceActivationStatus.ACTIVE,
++      },
++    });
++
++    for (const workspace of activeWorkspaces) {
++      try {
++        await this.processWorkspaceReconnections(workspace.id);
++      } catch (error) {
++        this.exceptionHandlerService.captureExceptions([error], {
++          workspace: {
++            id: workspace.id,
++          },
++        });
++      }
++    }
++
++    this.logger.log('Completed connected account auto-reconnect job');
++  }
++
++  private async processWorkspaceReconnections(
++    workspaceId: string,
++  ): Promise<void> {
++    const connectedAccountRepository =
++      await this.twentyORMGlobalManager.getRepositoryForWorkspace<ConnectedAccountWorkspaceEntity>(
++        workspaceId,
++        'connectedAccount',
++      );
++
++    // Get all connected accounts that have authFailedAt set (indicating they need reconnection)
++    const failedConnectedAccounts = await connectedAccountRepository.find({
++      where: {
++        authFailedAt: Not(IsNull()),
++      },
++      relations: {
++        accountOwner: true,
++      },
++    });
++
++    if (failedConnectedAccounts.length === 0) {
++      return;
++    }
++
++    this.logger.log(
++      `Found ${failedConnectedAccounts.length} failed connected accounts in workspace ${workspaceId}`,
++    );
++
++    for (const connectedAccount of failedConnectedAccounts) {
++      try {
++        await this.attemptAccountReconnection(connectedAccount, workspaceId);
++      } catch (error) {
++        this.logger.error(
++          `Failed to reconnect account ${connectedAccount.id} in workspace ${workspaceId}`,
++          error,
++        );
++      }
++    }
++  }
++
++  private async attemptAccountReconnection(
++    connectedAccount: ConnectedAccountWorkspaceEntity,
++    workspaceId: string,
++  ): Promise<void> {
++    this.logger.log(
++      `Attempting to reconnect ${connectedAccount.provider} account ${connectedAccount.id} in workspace ${workspaceId}`,
++    );
++
++    const connectedAccountRepository =
++      await this.twentyORMGlobalManager.getRepositoryForWorkspace<ConnectedAccountWorkspaceEntity>(
++        workspaceId,
++        'connectedAccount',
++      );
++
++    // Clear the auth failure timestamp
++    await connectedAccountRepository.update(connectedAccount.id, {
++      authFailedAt: null,
++    });
++
++    // Reactivate associated message channels
++    await this.reactivateMessageChannels(connectedAccount.id, workspaceId);
++
++    // Reactivate associated calendar channels
++    await this.reactivateCalendarChannels(connectedAccount.id, workspaceId);
++
++    // Remove from accounts to reconnect queue
++    await this.accountsToReconnectService.removeAccountToReconnect(
++      connectedAccount.accountOwner.userId,
++      workspaceId,
++      connectedAccount.id,
++    );
++
++    this.logger.log(
++      `Successfully reactivated connected account ${connectedAccount.id} in workspace ${workspaceId}`,
++    );
++  }
++
++  private async reactivateMessageChannels(
++    connectedAccountId: string,
++    workspaceId: string,
++  ): Promise<void> {
++    try {
++      const messageChannelRepository =
++        await this.twentyORMGlobalManager.getRepositoryForWorkspace<MessageChannelWorkspaceEntity>(
++          workspaceId,
++          'messageChannel',
++        );
++
++      const messageChannels = await messageChannelRepository.find({
++        where: {
++          connectedAccountId,
++        },
++      });
++
++      if (messageChannels.length > 0) {
++        const messageChannelIds = messageChannels.map((mc) => mc.id);
++
++        // Reset sync status to allow sync to resume
++        await messageChannelRepository.update(messageChannelIds, {
++          syncStatus: MessageChannelSyncStatus.ACTIVE,
++          syncStage: MessageChannelSyncStage.FULL_MESSAGE_LIST_FETCH_PENDING,
++          syncStageStartedAt: null,
++          throttleFailureCount: 0,
++          // syncedAt: null,
++          syncCursor: undefined,
++        });
++
++        this.logger.log(
++          `Reactivated ${messageChannels.length} message channels for account ${connectedAccountId} and scheduled message list fetch`,
++        );
++      }
++    } catch (error) {
++      this.logger.error(
++        `Failed to reactivate message channels for account ${connectedAccountId}`,
++        error,
++      );
++    }
++  }
++
++  private async reactivateCalendarChannels(
++    connectedAccountId: string,
++    workspaceId: string,
++  ): Promise<void> {
++    try {
++      const calendarChannelRepository =
++        await this.twentyORMGlobalManager.getRepositoryForWorkspace<CalendarChannelWorkspaceEntity>(
++          workspaceId,
++          'calendarChannel',
++        );
++
++      const calendarChannels = await calendarChannelRepository.find({
++        where: {
++          connectedAccountId,
++        },
++      });
++
++      if (calendarChannels.length > 0) {
++        const calendarChannelIds = calendarChannels.map((cc) => cc.id);
++
++        // Reset sync status to allow sync to resume
++        await calendarChannelRepository.update(calendarChannelIds, {
++          syncStatus: CalendarChannelSyncStatus.ACTIVE,
++          syncStage:
++            CalendarChannelSyncStage.FULL_CALENDAR_EVENT_LIST_FETCH_PENDING,
++          throttleFailureCount: 0,
++          // syncCursor: '',
++          syncStageStartedAt: null,
++        });
++
++        this.logger.log(
++          `Reactivated ${calendarChannels.length} calendar channels for account ${connectedAccountId} and scheduled calendar event list fetch`,
++        );
++      }
++    } catch (error) {
++      this.logger.error(
++        `Failed to reactivate calendar channels for account ${connectedAccountId}`,
++        error,
++      );
++    }
++  }
++}
 diff --git a/packages/twenty-server/src/modules/messaging/message-import-manager/drivers/gmail/services/gmail-get-message-list.service.ts b/packages/twenty-server/src/modules/messaging/message-import-manager/drivers/gmail/services/gmail-get-message-list.service.ts
 index 17aa6f686..dbff28628 100644
 --- a/packages/twenty-server/src/modules/messaging/message-import-manager/drivers/gmail/services/gmail-get-message-list.service.ts
@@ -308,411 +714,3 @@ index 491a45ae0..411f1362c 100644
        return messages;
      } catch (error) {
        this.logger.error(
-diff --git a/packages/twenty-docker/twenty/Dockerfile b/packages/twenty-docker/twenty/Dockerfile
-index 79525f6b7..9fd72c071 100644
---- a/packages/twenty-docker/twenty/Dockerfile
-+++ b/packages/twenty-docker/twenty/Dockerfile
-@@ -53,6 +53,9 @@ RUN npx nx build twenty-front
- # Final stage: Run the application
- FROM node:22-alpine as twenty
- 
-+# Stay as root for system package installations
-+USER root
-+
- # Used to run healthcheck in docker
- RUN apk add --no-cache curl jq
- 
-@@ -60,8 +63,14 @@ RUN npm install -g tsx
- 
- RUN apk add --no-cache postgresql-client
- 
--COPY ./packages/twenty-docker/twenty/entrypoint.sh /app/entrypoint.sh
-+# Create directories with proper ownership from the start
-+RUN mkdir -p /app/.local-storage /app/packages/twenty-server/.local-storage && \
-+    chown -R node:node /app
-+
-+COPY --chown=node:node ./packages/twenty-docker/twenty/entrypoint.sh /app/entrypoint.sh
- RUN chmod +x /app/entrypoint.sh
-+
-+
- WORKDIR /app/packages/twenty-server
- 
- ARG REACT_APP_SERVER_BASE_URL
-@@ -71,19 +80,13 @@ ARG APP_VERSION
- ENV APP_VERSION $APP_VERSION
- 
- # Copy built applications from previous stages
--COPY --chown=1000 --from=twenty-server-build /app /app
--COPY --chown=1000 --from=twenty-server-build /app/packages/twenty-server /app/packages/twenty-server
--COPY --chown=1000 --from=twenty-front-build /app/packages/twenty-front/build /app/packages/twenty-server/dist/front
-+COPY --chown=node:node --from=twenty-server-build /app /app
-+COPY --chown=node:node --from=twenty-server-build /app/packages/twenty-server /app/packages/twenty-server
-+COPY --chown=node:node --from=twenty-front-build /app/packages/twenty-front/build /app/packages/twenty-server/dist/front
- 
- # Set metadata and labels
- LABEL org.opencontainers.image.source=https://github.com/twentyhq/twenty
- LABEL org.opencontainers.image.description="This image provides a consistent and reproducible environment for the backend and frontend, ensuring it deploys faster and runs the same way regardless of the deployment environment."
- 
--RUN mkdir -p /app/.local-storage /app/packages/twenty-server/.local-storage && \
--    chown -R 1000:1000 /app
--
--# Use non root user with uid 1000
--USER 1000
--
- CMD ["node", "dist/src/main"]
- ENTRYPOINT ["/app/entrypoint.sh"]
-diff --git a/packages/twenty-server/src/modules/connected-account/connected-account.module.ts b/packages/twenty-server/src/modules/connected-account/connected-account.module.ts
-index 3888f9603..9615e917b 100644
---- a/packages/twenty-server/src/modules/connected-account/connected-account.module.ts
-+++ b/packages/twenty-server/src/modules/connected-account/connected-account.module.ts
-@@ -1,18 +1,35 @@
- import { Module } from '@nestjs/common';
-+import { TypeOrmModule } from '@nestjs/typeorm';
- 
-+import { CacheStorageModule } from 'src/engine/core-modules/cache-storage/cache-storage.module';
-+import { MetricsModule } from 'src/engine/core-modules/metrics/metrics.module';
- import { UserVarsModule } from 'src/engine/core-modules/user/user-vars/user-vars.module';
-+import { Workspace } from 'src/engine/core-modules/workspace/workspace.entity';
-+import { CalendarChannelSyncStatusService } from 'src/modules/calendar/common/services/calendar-channel-sync-status.service';
-+import { ConnectedAccountAutoReconnectCronCommand } from 'src/modules/connected-account/crons/commands/connected-account-auto-reconnect.cron.command';
-+import { ConnectedAccountAutoReconnectCronJob } from 'src/modules/connected-account/crons/jobs/connected-account-auto-reconnect.cron.job';
- import { DeleteWorkspaceMemberConnectedAccountsCleanupJob } from 'src/modules/connected-account/jobs/delete-workspace-member-connected-accounts.job';
- import { ConnectedAccountWorkspaceMemberListener } from 'src/modules/connected-account/listeners/connected-account-workspace-member.listener';
- import { ConnectedAccountListener } from 'src/modules/connected-account/listeners/connected-account.listener';
- import { AccountsToReconnectService } from 'src/modules/connected-account/services/accounts-to-reconnect.service';
-+import { MessageChannelSyncStatusService } from 'src/modules/messaging/common/services/message-channel-sync-status.service';
- 
- @Module({
--  imports: [UserVarsModule],
-+  imports: [
-+    UserVarsModule,
-+    TypeOrmModule.forFeature([Workspace], 'core'),
-+    CacheStorageModule,
-+    MetricsModule,
-+  ],
-   providers: [
-     AccountsToReconnectService,
-     ConnectedAccountListener,
-     DeleteWorkspaceMemberConnectedAccountsCleanupJob,
-     ConnectedAccountWorkspaceMemberListener,
-+    ConnectedAccountAutoReconnectCronJob,
-+    ConnectedAccountAutoReconnectCronCommand,
-+    MessageChannelSyncStatusService,
-+    CalendarChannelSyncStatusService,
-   ],
-   exports: [AccountsToReconnectService],
- })
-diff --git a/packages/twenty-server/src/modules/connected-account/crons/commands/connected-account-auto-reconnect.cron.command.ts b/packages/twenty-server/src/modules/connected-account/crons/commands/connected-account-auto-reconnect.cron.command.ts
-new file mode 100644
-index 0000000..ce2af475722584ca814d49633d6e2da89a2fac6e
---- /dev/null
-+++ b/packages/twenty-server/src/modules/connected-account/crons/commands/connected-account-auto-reconnect.cron.command.ts
-+import { Command, CommandRunner, Option } from 'nest-commander';
-+
-+import { InjectMessageQueue } from 'src/engine/core-modules/message-queue/decorators/message-queue.decorator';
-+import { MessageQueue } from 'src/engine/core-modules/message-queue/message-queue.constants';
-+import { MessageQueueService } from 'src/engine/core-modules/message-queue/services/message-queue.service';
-+import {
-+  CONNECTED_ACCOUNT_AUTO_RECONNECT_CRON_PATTERN,
-+  ConnectedAccountAutoReconnectCronJob,
-+} from 'src/modules/connected-account/crons/jobs/connected-account-auto-reconnect.cron.job';
-+
-+interface ConnectedAccountAutoReconnectCronCommandOptions {
-+  schedule?: boolean;
-+}
-+
-+@Command({
-+  name: 'cron:connected-account:auto-reconnect',
-+  description:
-+    'Run connected account auto-reconnect job immediately or schedule it as a cron job',
-+})
-+export class ConnectedAccountAutoReconnectCronCommand extends CommandRunner {
-+  constructor(
-+    @InjectMessageQueue(MessageQueue.cronQueue)
-+    private readonly messageQueueService: MessageQueueService,
-+    private readonly connectedAccountAutoReconnectCronJob: ConnectedAccountAutoReconnectCronJob,
-+  ) {
-+    super();
-+  }
-+
-+  async run(
-+    passedParams: string[],
-+    options?: ConnectedAccountAutoReconnectCronCommandOptions,
-+  ): Promise<void> {
-+    if (options?.schedule) {
-+      // Schedule the cron job
-+      await this.messageQueueService.addCron<undefined>({
-+        jobName: ConnectedAccountAutoReconnectCronJob.name,
-+        data: undefined,
-+        options: {
-+          repeat: {
-+            pattern: CONNECTED_ACCOUNT_AUTO_RECONNECT_CRON_PATTERN,
-+          },
-+        },
-+      });
-+      console.log('Cron job scheduled successfully');
-+    } else {
-+      // Run the job immediately
-+      console.log(
-+        'Running connected account auto-reconnect job immediately...',
-+      );
-+      try {
-+        await this.connectedAccountAutoReconnectCronJob.handle();
-+        console.log('Connected account auto-reconnect job completed');
-+
-+        // Give time for any pending operations to complete before shutdown
-+        await new Promise((resolve) => setTimeout(resolve, 1000));
-+      } catch (error) {
-+        console.error(
-+          'Error running connected account auto-reconnect job:',
-+          error,
-+        );
-+        throw error;
-+      }
-+    }
-+  }
-+
-+  @Option({
-+    flags: '-s, --schedule',
-+    description: 'Schedule the job as a cron instead of running immediately',
-+  })
-+  parseSchedule(): boolean {
-+    return true;
-+  }
-+}
-diff --git a/packages/twenty-server/src/modules/connected-account/crons/jobs/connected-account-auto-reconnect.cron.job.ts b/packages/twenty-server/src/modules/connected-account/crons/jobs/connected-account-auto-reconnect.cron.job.ts
-new file mode 100644
-index 0000000..8b2d8821cd107071900d8ae6c4ece71da392f998
---- /dev/null
-+++ b/packages/twenty-server/src/modules/connected-account/crons/jobs/connected-account-auto-reconnect.cron.job.ts
-+import { Logger } from '@nestjs/common';
-+import { InjectRepository } from '@nestjs/typeorm';
-+
-+import { WorkspaceActivationStatus } from 'twenty-shared/workspace';
-+import { IsNull, Not, Repository } from 'typeorm';
-+
-+import { SentryCronMonitor } from 'src/engine/core-modules/cron/sentry-cron-monitor.decorator';
-+import { ExceptionHandlerService } from 'src/engine/core-modules/exception-handler/exception-handler.service';
-+import { Process } from 'src/engine/core-modules/message-queue/decorators/process.decorator';
-+import { Processor } from 'src/engine/core-modules/message-queue/decorators/processor.decorator';
-+import { MessageQueue } from 'src/engine/core-modules/message-queue/message-queue.constants';
-+import { Workspace } from 'src/engine/core-modules/workspace/workspace.entity';
-+import { TwentyORMGlobalManager } from 'src/engine/twenty-orm/twenty-orm-global.manager';
-+import {
-+  CalendarChannelSyncStage,
-+  CalendarChannelSyncStatus,
-+  CalendarChannelWorkspaceEntity,
-+} from 'src/modules/calendar/common/standard-objects/calendar-channel.workspace-entity';
-+import { AccountsToReconnectService } from 'src/modules/connected-account/services/accounts-to-reconnect.service';
-+import { ConnectedAccountWorkspaceEntity } from 'src/modules/connected-account/standard-objects/connected-account.workspace-entity';
-+import {
-+  MessageChannelSyncStage,
-+  MessageChannelSyncStatus,
-+  MessageChannelWorkspaceEntity,
-+} from 'src/modules/messaging/common/standard-objects/message-channel.workspace-entity';
-+
-+export const CONNECTED_ACCOUNT_AUTO_RECONNECT_CRON_PATTERN = '* * * * *'; // Every 10 minutes
-+
-+@Processor(MessageQueue.cronQueue)
-+export class ConnectedAccountAutoReconnectCronJob {
-+  private readonly logger = new Logger(
-+    ConnectedAccountAutoReconnectCronJob.name,
-+  );
-+
-+  constructor(
-+    @InjectRepository(Workspace, 'core')
-+    private readonly workspaceRepository: Repository<Workspace>,
-+    private readonly twentyORMGlobalManager: TwentyORMGlobalManager,
-+    private readonly accountsToReconnectService: AccountsToReconnectService,
-+    private readonly exceptionHandlerService: ExceptionHandlerService,
-+  ) {}
-+
-+  @Process(ConnectedAccountAutoReconnectCronJob.name)
-+  @SentryCronMonitor(
-+    ConnectedAccountAutoReconnectCronJob.name,
-+    CONNECTED_ACCOUNT_AUTO_RECONNECT_CRON_PATTERN,
-+  )
-+  async handle(): Promise<void> {
-+    this.logger.log('Starting connected account auto-reconnect job');
-+
-+    const activeWorkspaces = await this.workspaceRepository.find({
-+      where: {
-+        activationStatus: WorkspaceActivationStatus.ACTIVE,
-+      },
-+    });
-+
-+    for (const workspace of activeWorkspaces) {
-+      try {
-+        await this.processWorkspaceReconnections(workspace.id);
-+      } catch (error) {
-+        this.exceptionHandlerService.captureExceptions([error], {
-+          workspace: {
-+            id: workspace.id,
-+          },
-+        });
-+      }
-+    }
-+
-+    this.logger.log('Completed connected account auto-reconnect job');
-+  }
-+
-+  private async processWorkspaceReconnections(
-+    workspaceId: string,
-+  ): Promise<void> {
-+    const connectedAccountRepository =
-+      await this.twentyORMGlobalManager.getRepositoryForWorkspace<ConnectedAccountWorkspaceEntity>(
-+        workspaceId,
-+        'connectedAccount',
-+      );
-+
-+    // Get all connected accounts that have authFailedAt set (indicating they need reconnection)
-+    const failedConnectedAccounts = await connectedAccountRepository.find({
-+      where: {
-+        authFailedAt: Not(IsNull()),
-+      },
-+      relations: {
-+        accountOwner: true,
-+      },
-+    });
-+
-+    if (failedConnectedAccounts.length === 0) {
-+      return;
-+    }
-+
-+    this.logger.log(
-+      `Found ${failedConnectedAccounts.length} failed connected accounts in workspace ${workspaceId}`,
-+    );
-+
-+    for (const connectedAccount of failedConnectedAccounts) {
-+      try {
-+        await this.attemptAccountReconnection(connectedAccount, workspaceId);
-+      } catch (error) {
-+        this.logger.error(
-+          `Failed to reconnect account ${connectedAccount.id} in workspace ${workspaceId}`,
-+          error,
-+        );
-+      }
-+    }
-+  }
-+
-+  private async attemptAccountReconnection(
-+    connectedAccount: ConnectedAccountWorkspaceEntity,
-+    workspaceId: string,
-+  ): Promise<void> {
-+    this.logger.log(
-+      `Attempting to reconnect ${connectedAccount.provider} account ${connectedAccount.id} in workspace ${workspaceId}`,
-+    );
-+
-+    const connectedAccountRepository =
-+      await this.twentyORMGlobalManager.getRepositoryForWorkspace<ConnectedAccountWorkspaceEntity>(
-+        workspaceId,
-+        'connectedAccount',
-+      );
-+
-+    // Clear the auth failure timestamp
-+    await connectedAccountRepository.update(connectedAccount.id, {
-+      authFailedAt: null,
-+    });
-+
-+    // Reactivate associated message channels
-+    await this.reactivateMessageChannels(connectedAccount.id, workspaceId);
-+
-+    // Reactivate associated calendar channels
-+    await this.reactivateCalendarChannels(connectedAccount.id, workspaceId);
-+
-+    // Remove from accounts to reconnect queue
-+    await this.accountsToReconnectService.removeAccountToReconnect(
-+      connectedAccount.accountOwner.userId,
-+      workspaceId,
-+      connectedAccount.id,
-+    );
-+
-+    this.logger.log(
-+      `Successfully reactivated connected account ${connectedAccount.id} in workspace ${workspaceId}`,
-+    );
-+  }
-+
-+  private async reactivateMessageChannels(
-+    connectedAccountId: string,
-+    workspaceId: string,
-+  ): Promise<void> {
-+    try {
-+      const messageChannelRepository =
-+        await this.twentyORMGlobalManager.getRepositoryForWorkspace<MessageChannelWorkspaceEntity>(
-+          workspaceId,
-+          'messageChannel',
-+        );
-+
-+      const messageChannels = await messageChannelRepository.find({
-+        where: {
-+          connectedAccountId,
-+        },
-+      });
-+
-+      if (messageChannels.length > 0) {
-+        const messageChannelIds = messageChannels.map((mc) => mc.id);
-+
-+        // Reset sync status to allow sync to resume
-+        await messageChannelRepository.update(messageChannelIds, {
-+          syncStatus: MessageChannelSyncStatus.ACTIVE,
-+          syncStage: MessageChannelSyncStage.FULL_MESSAGE_LIST_FETCH_PENDING,
-+          syncStageStartedAt: null,
-+          throttleFailureCount: 0,
-+          // syncedAt: null,
-+          syncCursor: undefined,
-+        });
-+
-+        this.logger.log(
-+          `Reactivated ${messageChannels.length} message channels for account ${connectedAccountId} and scheduled message list fetch`,
-+        );
-+      }
-+    } catch (error) {
-+      this.logger.error(
-+        `Failed to reactivate message channels for account ${connectedAccountId}`,
-+        error,
-+      );
-+    }
-+  }
-+
-+  private async reactivateCalendarChannels(
-+    connectedAccountId: string,
-+    workspaceId: string,
-+  ): Promise<void> {
-+    try {
-+      const calendarChannelRepository =
-+        await this.twentyORMGlobalManager.getRepositoryForWorkspace<CalendarChannelWorkspaceEntity>(
-+          workspaceId,
-+          'calendarChannel',
-+        );
-+
-+      const calendarChannels = await calendarChannelRepository.find({
-+        where: {
-+          connectedAccountId,
-+        },
-+      });
-+
-+      if (calendarChannels.length > 0) {
-+        const calendarChannelIds = calendarChannels.map((cc) => cc.id);
-+
-+        // Reset sync status to allow sync to resume
-+        await calendarChannelRepository.update(calendarChannelIds, {
-+          syncStatus: CalendarChannelSyncStatus.ACTIVE,
-+          syncStage:
-+            CalendarChannelSyncStage.FULL_CALENDAR_EVENT_LIST_FETCH_PENDING,
-+          throttleFailureCount: 0,
-+          // syncCursor: '',
-+          syncStageStartedAt: null,
-+        });
-+
-+        this.logger.log(
-+          `Reactivated ${calendarChannels.length} calendar channels for account ${connectedAccountId} and scheduled calendar event list fetch`,
-+        );
-+      }
-+    } catch (error) {
-+      this.logger.error(
-+        `Failed to reactivate calendar channels for account ${connectedAccountId}`,
-+        error,
-+      );
-+    }
-+  }
-+}

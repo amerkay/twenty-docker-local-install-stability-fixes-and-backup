@@ -9,6 +9,10 @@
 		"editor.formatOnSave": true,
 		"explorer.autoRevealExclude": {
 			"**/twenty/**": true
-		}
+		},
+		"files.exclude": {
+			"twenty/**": true
+		},
+		"search.useGlobalIgnoreFiles": true
 	}
 }

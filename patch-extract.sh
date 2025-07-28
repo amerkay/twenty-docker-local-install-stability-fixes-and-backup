@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Script to extract patches from git changes in the ./twenty/ repository
-# Usage: ./patch-extract.sh [output_filename] [--staged]
+# Usage: ./patch-extract.sh [output_filename]
 
 set -e  # Exit on any error
 
@@ -54,112 +54,30 @@ cd "$TWENTY_REPO_PATH"
 echo "Extracting patches from twenty repository..."
 echo "Repository path: $(pwd)"
 
-# Check for all types of changes
-HAS_CHANGES=false
-
-# Check for staged changes
-echo "Checking for staged changes..."
-HAS_STAGED_CHANGES=false
-if ! git diff --cached --quiet 2>/dev/null; then
-    HAS_STAGED_CHANGES=true
-    HAS_CHANGES=true
-    echo "Found staged changes."
-fi
-
-# Check for unstaged changes
-echo "Checking for unstaged changes..."
-HAS_UNSTAGED_CHANGES=false
-if ! git diff --quiet 2>/dev/null; then
-    HAS_UNSTAGED_CHANGES=true
-    HAS_CHANGES=true
-    echo "Found unstaged changes."
-fi
-
-# Check for new/untracked files
-echo "Checking for new/untracked files..."
-NEW_FILES=$(git ls-files --others --exclude-standard)
-if [[ -n "$NEW_FILES" ]]; then
-    HAS_CHANGES=true
-    echo "Found new files to include in patch."
-fi
-
-if [[ "$HAS_CHANGES" == "false" ]]; then
+# Check if there are any changes (staged, unstaged, or untracked)
+if [[ -z $(git status --porcelain) ]]; then
     echo "No changes found in the repository."
     echo "No staged changes, unstaged changes, or new files to include in patch."
-    echo ""
-    echo "Tip: Make some changes to files, stage them with 'git add', or create new files."
     exit 0
 fi
 
-# Get the list of all changed files
-echo "Getting list of all changed files..."
-
-if [[ "$HAS_STAGED_CHANGES" == "true" ]]; then
-    STAGED_FILES=$(git diff --cached --name-only)
-    echo "Staged files:"
-    echo "$STAGED_FILES" | sed 's/^/  S /'
-fi
-
-if [[ "$HAS_UNSTAGED_CHANGES" == "true" ]]; then
-    UNSTAGED_FILES=$(git diff --name-only)
-    echo "Modified files (unstaged):"
-    echo "$UNSTAGED_FILES" | sed 's/^/  M /'
-fi
-
-if [[ -n "$NEW_FILES" ]]; then
-    echo "New files:"
-    echo "$NEW_FILES" | sed 's/^/  + /'
-fi
+echo "Found the following changes to include in the patch:"
+git status --short | sed 's/^/  /'
 echo ""
 
-# Generate the patch
+# Generate the patch using the 'stage all -> diff -> reset' method
+# This method reliably includes all staged, unstaged, and untracked files.
 echo "Generating patch..."
 PATCH_PATH="../$OUTPUT_FILE"
 
-# Function to generate patch for a new file
-generate_new_file_patch() {
-    local file_path="$1"
-    local patch_file="$2"
-    
-    echo "diff --git a/$file_path b/$file_path" >> "$patch_file"
-    echo "new file mode 100644" >> "$patch_file"
-    echo "index 0000000..$(git hash-object "$file_path" 2>/dev/null || echo "0000000")" >> "$patch_file"
-    echo "--- /dev/null" >> "$patch_file"
-    echo "+++ b/$file_path" >> "$patch_file"
-    
-    # Add the file content with + prefix
-    if [[ -f "$file_path" ]]; then
-        while IFS= read -r line || [[ -n "$line" ]]; do
-            echo "+$line" >> "$patch_file"
-        done < "$file_path"
-    fi
-}
+# 1. Temporarily stage ALL changes (modified, new, deleted).
+git add -A
 
-# Initialize the patch file
-> "$PATCH_PATH"
+# 2. Create the patch from the index (all staged changes).
+git diff --cached > "$PATCH_PATH"
 
-# Generate patch for staged changes
-if [[ "$HAS_STAGED_CHANGES" == "true" ]]; then
-    echo "Adding staged changes to patch..."
-    git diff --cached >> "$PATCH_PATH"
-fi
-
-# Generate patch for unstaged changes
-if [[ "$HAS_UNSTAGED_CHANGES" == "true" ]]; then
-    echo "Adding unstaged changes to patch..."
-    git diff >> "$PATCH_PATH"
-fi
-
-# Generate patches for new files and append them
-if [[ -n "$NEW_FILES" ]]; then
-    echo "Adding new files to patch..."
-    while IFS= read -r file; do
-        if [[ -n "$file" ]]; then
-            echo "  Adding new file: $file"
-            generate_new_file_patch "$file" "$PATCH_PATH"
-        fi
-    done <<< "$NEW_FILES"
-fi
+# 3. Reset the index to its original state, unstaging the files.
+git reset >/dev/null
 
 # Return to the original directory
 cd ..
