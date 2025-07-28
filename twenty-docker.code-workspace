@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"github.copilot.chat.edits.temporalContext.enabled": true,
+		"editor.formatOnSave": true,
+		"explorer.autoRevealExclude": {
+			"**/twenty/**": true
+		}
+	}
+}

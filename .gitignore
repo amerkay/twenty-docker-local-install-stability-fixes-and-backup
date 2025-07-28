@@ -1,0 +1,10 @@
+.aider*
+.env
+server-local-data
+db-data
+node_modules
+.nx
+db-backups-archive/
+db_backup_latest.sql
+db_dump.sql
+twenty/
