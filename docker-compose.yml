@@ -166,6 +166,7 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    restart: always
     networks:
       - twenty-network
 
@@ -195,7 +196,7 @@ services:
         echo '0 */6 * * * find /workspace/db-backups-archive -name \"*.sql\" -type f -mtime +3 -delete && echo \"Cleaned old backups: \$$(date)\" >> /var/log/cleanup.log' >> /etc/crontabs/root &&
         mkdir -p /var/log &&
         echo \"Starting backup scheduler...\" &&
-        crond -f -d 8
+        crond -f
       "
     depends_on:
       db:
