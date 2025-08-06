@@ -160,7 +160,7 @@ fi
 
 # Get last 12 tags sorted by date (descending)
 print_step "Getting available tags..."
-TAGS=($(git tag -l --sort=-creatordate | head -12))
+TAGS=("HEAD" $(git tag -l --sort=-creatordate | head -11))
 
 if [[ ${#TAGS[@]} -eq 0 ]]; then
     print_error "No tags found in repository"
@@ -173,24 +173,32 @@ if [[ ${#TAGS[@]} -eq 0 ]]; then
     fi
 else
     echo ""
-    echo "Available tags (last 12, sorted by date):"
-    echo "=========================================="
+    echo "Available options (HEAD + last 11 tags, sorted by date):"
+    echo "========================================================"
     
     # Display tag options
     for i in "${!TAGS[@]}"; do
         tag="${TAGS[$i]}"
-        tag_date=$(git log -1 --format=%ai "$tag" 2>/dev/null || echo "unknown date")
         
-        # Mark current tag and newest tag
-        markers=""
-        if [[ "$tag" == "$CURRENT_TAG" ]]; then
-            markers="📍 CURRENT"
-        fi
-        if [[ $i -eq 0 ]]; then
-            if [[ -n "$markers" ]]; then
-                markers="$markers 🚀 NEWEST"
-            else
-                markers="🚀 NEWEST"
+        # Handle HEAD specially
+        if [[ "$tag" == "HEAD" ]]; then
+            # Show current date/time for HEAD since it represents the current state
+            tag_date=$(date '+%Y-%m-%d %H:%M:%S %z')
+            markers="🔄 CURRENT HEAD"
+        else
+            tag_date=$(git log -1 --format=%ai "$tag" 2>/dev/null || echo "unknown date")
+            
+            # Mark current tag and newest tag
+            markers=""
+            if [[ "$tag" == "$CURRENT_TAG" ]]; then
+                markers="📍 CURRENT"
+            fi
+            if [[ $i -eq 1 ]]; then  # First actual tag (index 1, since HEAD is at index 0)
+                if [[ -n "$markers" ]]; then
+                    markers="$markers 🚀 NEWEST"
+                else
+                    markers="🚀 NEWEST"
+                fi
             fi
         fi
         
@@ -198,20 +206,23 @@ else
     done
     
     echo ""
-    echo "Select a tag to checkout (default: 1 - newest tag):"
+    echo "Select an option to checkout (default: 1 - HEAD):"
     read -p "Enter number [1-${#TAGS[@]}]: " -r SELECTION
     
     # Validate selection
     if [[ -z "$SELECTION" ]]; then
         SELECTION=1
     elif ! [[ "$SELECTION" =~ ^[0-9]+$ ]] || [[ "$SELECTION" -lt 1 ]] || [[ "$SELECTION" -gt ${#TAGS[@]} ]]; then
-        print_error "Invalid selection. Using newest tag (1)."
+        print_error "Invalid selection. Using HEAD (1)."
         SELECTION=1
     fi
     
     SELECTED_TAG="${TAGS[$((SELECTION-1))]}"
     
-    if [[ "$SELECTED_TAG" == "$CURRENT_TAG" ]]; then
+    # Handle HEAD selection specially
+    if [[ "$SELECTED_TAG" == "HEAD" ]]; then
+        print_success "Staying on current HEAD (no checkout needed)"
+    elif [[ "$SELECTED_TAG" == "$CURRENT_TAG" ]]; then
         print_success "Already on selected tag: $SELECTED_TAG"
     else
         print_step "Checking out tag: $SELECTED_TAG"
@@ -316,7 +327,9 @@ print_success "🎉 All operations completed successfully!"
 echo ""
 echo "Summary of what was done:"
 echo "  ✅ Reverted all changes in ./twenty/ repository"
-if [[ -n "$SELECTED_TAG" ]]; then
+if [[ "$SELECTED_TAG" == "HEAD" ]]; then
+    echo "  ✅ Stayed on current HEAD"
+elif [[ -n "$SELECTED_TAG" ]]; then
     echo "  ✅ Checked out tag: $SELECTED_TAG"
 else
     echo "  ✅ Updated to latest main branch"

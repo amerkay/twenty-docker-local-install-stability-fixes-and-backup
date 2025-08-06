@@ -56,6 +56,7 @@ services:
       EMAIL_SMTP_PASSWORD: ${EMAIL_SMTP_PASSWORD:-}
 
       MESSAGING_SINCE_DATE: ${MESSAGING_SINCE_DATE:-2025-06-15}
+      OAI_KEY: ${OAI_KEY:-}
 
     depends_on:
       db:
@@ -118,6 +119,7 @@ services:
       EMAIL_SMTP_PASSWORD: ${EMAIL_SMTP_PASSWORD:-}
 
       MESSAGING_SINCE_DATE: ${MESSAGING_SINCE_DATE:-2025-06-15}
+      OAI_KEY: ${OAI_KEY:-}
 
     depends_on:
       db:
@@ -135,8 +137,8 @@ services:
     environment:
       POSTGRES_USER: ${PG_DATABASE_USER}
       POSTGRES_PASSWORD: ${PG_DATABASE_PASSWORD}
-    ports:
-      - "5432:5432"
+    # ports:
+    #   - "5432:5432"
     healthcheck:
       test: pg_isready -U ${PG_DATABASE_USER} -h localhost -d postgres
       interval: 10s
@@ -174,8 +176,8 @@ services:
     image: redis
     restart: always
     command: ["--maxmemory-policy", "noeviction"]
-    ports:
-      - "7379:6379"
+    # ports:
+    #   - "7379:6379"
     networks:
       - twenty-network
 
