@@ -9,3 +9,4 @@ db_backup_latest.sql
 db_dump.sql
 twenty/
 changes.zip
+.env-dev
